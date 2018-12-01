@@ -1,0 +1,142 @@
+
+pipeline {
+  agent any
+
+  stages {
+    stage('Build') {
+      when { not { branch 'p2c' } }
+      steps {
+        echo 'Building..'
+        sh './gradlew assemble'
+      }
+    }
+
+    stage('Test') {
+      when { not { branch 'p2c' } }
+      steps {
+        echo 'Testing..'
+        sh './gradlew test'
+      }
+    }
+
+    stage('Archive artifacts') {
+      when { not { branch 'p2c' } }
+      steps {
+        echo "GIT_COMMIT is ${env.GIT_COMMIT}"
+        echo "GIT_BRANCH is ${env.GIT_BRANCH}"
+
+        sh 'tar cvf artifacts.tar */build/libs/*.jar */manifest*yml scripts p2c'
+        sh 'gzip artifacts.tar'
+
+        script {
+          def server = Artifactory.server 'ccp2-artifactory'
+          def buildInfo = Artifactory.newBuildInfo()
+          buildInfo.env.capture = true
+
+          def build = "customer-stores-${env.GIT_BRANCH}-${env.GIT_COMMIT}"
+
+          def uploadSpec = """{
+            "files": [{
+              "pattern": "artifacts.tar.gz",
+              "target":  "libs-snapshot/${build}.tar.gz"
+            }]
+          }"""
+
+          server.upload(uploadSpec, buildInfo)
+          server.publishBuildInfo(buildInfo)
+        }
+      }
+
+      post {
+        always {
+          cleanWs()
+        }
+      }
+    }
+
+    stage('Blue-Green deploy using shell script') {
+      when { not { branch 'p2c' } }
+      environment {
+        CF_API = 'https://api.lyra-836.appcloud.swisscom.com'
+        CF_ORG = 'ZHAW@Dominic/April2018'
+        CF_SPACE = 'team-15'
+        CF_CRED = credentials('swisscom-developer-portal')
+      }
+      steps {
+        echo "Deploying ${env.GIT_BRANCH} branch (${env.GIT_COMMIT}) ..."
+        echo "CRED = ${env.CF_CRED_USR} – ${env.CF_CRED_PSW}"
+
+        script {
+          def server = Artifactory.server 'ccp2-artifactory'
+
+          def build = "customer-stores-${env.GIT_BRANCH}-${env.GIT_COMMIT}"
+
+          def downloadSpec = """{
+            "files": [{
+              "pattern": "libs-snapshot/${build}.tar.gz",
+              "target":  "artifacts.tar.gz"
+            }]
+          }"""
+
+          server.download(downloadSpec)
+        }
+
+        sh 'tar xvzf artifacts.tar.gz'
+
+        sh 'scripts/1-deploy-new.sh stores/manifest.yml'
+        sh 'scripts/2-verify-new.sh stores/manifest.yml'
+        input message:'New app deployed and verifyied'
+
+        sh 'scripts/3-switch-to-new.sh stores/manifest.yml'
+        input message:'Switched to new app'
+
+        sh 'scripts/4-cleanup.sh stores/manifest.yml'
+
+      }
+    }
+
+
+    stage('Blue-Green deploy using push2cloud') {
+      when { branch 'p2c' }
+
+      steps {
+
+        echo "Deploying ${env.GIT_BRANCH} branch (${env.GIT_COMMIT}) ..."
+
+        echo 'Prepare push2cloud'
+        sh '''
+           cd ${WORKSPACE}/p2c
+           npm install
+           '''
+
+        echo 'Compile push2cloud deployment configuration'
+        sh '''
+           cd ${WORKSPACE}/p2c
+           DEBUG=push2cloud* p2c compile -e ./manifests/deployment.json -c
+           '''
+
+        echo 'Deploy blue green'
+        withCredentials([usernamePassword(credentialsId: 'swisscom-developer-portal',
+                passwordVariable: 'CF_PWD', usernameVariable: 'CF_USER')]) {
+            sh '''
+               cd ${WORKSPACE}/p2c
+               DEBUG=push2cloud* p2c exec ./workflows/blueGreen.js
+            '''
+        }
+
+      }
+    }
+  }
+
+  post {
+    success {
+      echo "Pipeline successfull: ${currentBuild.fullDisplayName}"
+    }
+    failure {
+      mail to: 'mach@zhaw.ch',
+                subject: "Failed Pipeline: ${currentBuild.fullDisplayName}",
+                body: "Something is wrong with your build ${env.BUILD_URL}"
+    }
+  }
+
+}
